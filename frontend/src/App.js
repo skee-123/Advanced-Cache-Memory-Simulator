@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell, Area, AreaChart } from 'recharts';
-import { Play, Pause, RotateCcw, Download, Sun, Moon, Info, StepForward, Zap } from 'lucide-react';
+import { Play, RotateCcw, Download, Sun, Moon, Info, StepForward, Zap } from 'lucide-react';
 
 // Cache Core Logic
 class CacheSimulator {
@@ -28,7 +28,7 @@ class CacheSimulator {
   }
 
   initializeCache() {
-    const { cacheSize, blockSize, associativity, levels } = this.config;
+    const { cacheSize, associativity, levels } = this.config;
     
     // L1 Cache
     const sets = associativity === 'direct' ? cacheSize : 
@@ -80,7 +80,7 @@ class CacheSimulator {
 
   access(address, type = 'read', currentTime) {
     this.stats.totalAccesses++;
-    const { cacheSize, associativity, blockSize, replacement, writePolicy, levels } = this.config;
+    const { cacheSize, associativity, blockSize, writePolicy, levels } = this.config;
     
     // Calculate index and tag
     const blockAddr = Math.floor(address / blockSize);
@@ -359,12 +359,12 @@ const App = () => {
   const [darkMode, setDarkMode] = useState(true);
   const [showTooltip, setShowTooltip] = useState(null);
   const [autoRun, setAutoRun] = useState(false);
-  const [comparisonMode, setComparisonMode] = useState(false);
 
   useEffect(() => {
-    initSimulator();
+    const sim = new CacheSimulator(config);
+    setSimulator(sim);
+    setCurrentStep(0);
   }, [config]);
-
   const initSimulator = () => {
     const sim = new CacheSimulator(config);
     setSimulator(sim);
@@ -438,19 +438,18 @@ const App = () => {
     a.download = 'cache_simulation_results.json';
     a.click();
   };
-
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (autoRun && isRunning) {
       const timer = setTimeout(runSimulation, 500);
       return () => clearTimeout(timer);
     }
-  }, [autoRun, isRunning, currentStep]);
+  }, [autoRun, isRunning, currentStep]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!simulator) return <div className="flex items-center justify-center h-screen">Loading...</div>;
 
   const hitMissData = [
     { name: 'L1 Hits', value: simulator.stats.l1Hits, fill: '#10b981' },
-    { name: 'L2 Hits', value: simulator.stats.l2Hits, fill: '#3b82f6' },
     { name: 'L3 Hits', value: simulator.stats.l3Hits, fill: '#8b5cf6' },
     { name: 'Misses', value: simulator.stats.misses, fill: '#ef4444' }
   ];
@@ -1030,3 +1029,5 @@ const App = () => {
 };
 
 export default App;
+
+

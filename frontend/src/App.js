@@ -6,9 +6,11 @@ import { Play, RotateCcw, Download, Sun, Moon, Info, StepForward, Zap } from 'lu
 class CacheSimulator {
   constructor(config) {
     this.config = config;
+
     this.cache = [];
     this.l2Cache = [];
     this.l3Cache = [];
+
     this.stats = {
       hits: 0,
       misses: 0,
@@ -18,27 +20,50 @@ class CacheSimulator {
       memoryAccesses: 0,
       writeHits: 0,
       writeMisses: 0,
+      memoryWrites: 0,
       totalAccesses: 0,
       stallCycles: 0,
+      totalAccessTime: 0,
       powerConsumption: 0
     };
+
     this.accessHistory = [];
     this.replacementHistory = [];
+
     this.initializeCache();
   }
 
-  initializeCache() {
-    const { cacheSize, associativity, levels } = this.config;
-    
-    // L1 Cache
-    const sets = associativity === 'direct' ? cacheSize : 
-                 associativity === 'full' ? 1 : 
-                 Math.floor(cacheSize / parseInt(associativity.split('-')[0]));
-    
-    this.cache = Array(sets).fill(null).map(() => 
-      Array(associativity === 'direct' ? 1 : 
-            associativity === 'full' ? cacheSize : 
-            parseInt(associativity.split('-')[0])).fill(null).map(() => ({
+  getLevelParameters(capacity) {
+    const { associativity } = this.config;
+
+    if (associativity === 'direct') {
+      return {
+        sets: capacity,
+        ways: 1
+      };
+    }
+
+    if (associativity === 'full') {
+      return {
+        sets: 1,
+        ways: capacity
+      };
+    }
+
+    const ways = parseInt(associativity.split('-')[0], 10);
+    const sets = Math.max(1, Math.floor(capacity / ways));
+
+    return {
+      sets,
+      ways
+    };
+  }
+
+  createCache(capacity) {
+    const { sets, ways } = this.getLevelParameters(capacity);
+
+    return Array.from({ length: sets }, () =>
+      Array.from({ length: ways }, () => ({
         valid: false,
         tag: null,
         data: null,
@@ -48,142 +73,265 @@ class CacheSimulator {
         insertTime: 0
       }))
     );
+  }
 
-    // L2 Cache (4x larger)
+  initializeCache() {
+    const { cacheSize, levels } = this.config;
+
+    // L1 = configured cache size.
+    this.cache = this.createCache(cacheSize);
+
+    /*
+     * Educational hierarchy:
+     * L2 has 4x the L1 capacity.
+     * L3 has 16x the L1 capacity.
+     *
+     * These are simulator assumptions, not measurements
+     * of a real processor.
+     */
     if (levels >= 2) {
-      this.l2Cache = Array(sets * 2).fill(null).map(() => 
-        Array(4).fill(null).map(() => ({
-          valid: false,
-          tag: null,
-          data: null,
-          dirty: false,
-          lastAccess: 0,
-          accessCount: 0
-        }))
-      );
+      this.l2Cache = this.createCache(cacheSize * 4);
+    } else {
+      this.l2Cache = [];
     }
-
-    // L3 Cache (8x larger)
     if (levels >= 3) {
-      this.l3Cache = Array(sets * 4).fill(null).map(() => 
-        Array(8).fill(null).map(() => ({
-          valid: false,
-          tag: null,
-          data: null,
-          dirty: false,
-          lastAccess: 0,
-          accessCount: 0
-        }))
-      );
+      this.l3Cache = this.createCache(cacheSize * 16);
+    } else {
+      this.l3Cache = [];
     }
   }
 
-  access(address, type = 'read', currentTime) {
+  getAddressParts(address, cache) {
+    const { blockSize } = this.config;
+
+    const blockAddress = Math.floor(address / blockSize);
+
+    if (!cache || cache.length === 0) {
+      return {
+        blockAddress,
+        index: 0,
+        tag: blockAddress
+      };
+    }
+
+    const index = blockAddress % cache.length;
+    const tag = Math.floor(blockAddress / cache.length);
+
+    return {
+      blockAddress,
+      index,
+      tag
+    };
+  }
+
+  findBlock(cache, address) {
+    if (!cache || cache.length === 0) {
+      return {
+        index: 0,
+        tag: null,
+        blockIndex: -1
+      };
+    }
+
+    const { index, tag } = this.getAddressParts(address, cache);
+    const set = cache[index] || [];
+
+    const blockIndex = set.findIndex(
+      block => block && block.valid && block.tag === tag
+    );
+
+    return {
+      index,
+      tag,
+      blockIndex
+    };
+  }
+
+  access(address, type = 'read', currentTime = 0) {
     this.stats.totalAccesses++;
-    const { cacheSize, associativity, blockSize, writePolicy, levels } = this.config;
-    
-    // Calculate index and tag
-    const blockAddr = Math.floor(address / blockSize);
-    const sets = associativity === 'direct' ? cacheSize : 
-                 associativity === 'full' ? 1 : 
-                 Math.floor(cacheSize / parseInt(associativity.split('-')[0]));
-    const index = blockAddr % sets;
-    const tag = Math.floor(blockAddr / sets);
+
+    const { levels, writePolicy } = this.config;
 
     let hit = false;
     let level = 0;
     let accessTime = 0;
-    let stallCycles = 0;
 
-    // Check L1
-    const set = this.cache[index] || [];
-    const blockIndex = set.findIndex(block => block && block.valid && block.tag === tag);
-    
-    if (blockIndex !== -1) {
+    // -------------------------
+    // L1 lookup
+    // -------------------------
+    const l1Result = this.findBlock(this.cache, address);
+
+    if (l1Result.blockIndex !== -1) {
+      const block = this.cache[l1Result.index][l1Result.blockIndex];
+
       hit = true;
       level = 1;
-      accessTime = 1; // 1 cycle for L1 hit
+      accessTime = 1;
+
       this.stats.hits++;
       this.stats.l1Hits++;
-      set[blockIndex].lastAccess = currentTime;
-      set[blockIndex].accessCount++;
-      
-      if (type === 'write') {
-        this.stats.writeHits++;
-        if (writePolicy === 'write-back') {
-          set[blockIndex].dirty = true;
-        }
-      }
-    } else {
-      // L1 Miss - check L2
-      if (levels >= 2 && this.l2Cache.length > 0) {
-        const l2Index = blockAddr % this.l2Cache.length;
-        const l2Set = this.l2Cache[l2Index] || [];
-        const l2BlockIndex = l2Set.findIndex(block => block && block.valid && block.tag === tag);
-        
-        if (l2BlockIndex !== -1) {
-          hit = true;
-          level = 2;
-          accessTime = 10; // 10 cycles for L2 hit
-          stallCycles = 9;
-          this.stats.l2Hits++;
-          this.stats.hits++; // Count as hit
-          l2Set[l2BlockIndex].lastAccess = currentTime;
-          l2Set[l2BlockIndex].accessCount++;
-          
-          // Load into L1
-          this.loadBlock(index, tag, address, currentTime);
-        } else if (levels >= 3 && this.l3Cache.length > 0) {
-          // L2 Miss - check L3
-          const l3Index = blockAddr % this.l3Cache.length;
-          const l3Set = this.l3Cache[l3Index] || [];
-          const l3BlockIndex = l3Set.findIndex(block => block && block.valid && block.tag === tag);
-          
-          if (l3BlockIndex !== -1) {
-            hit = true;
-            level = 3;
-            accessTime = 30; // 30 cycles for L3 hit
-            stallCycles = 29;
-            this.stats.l3Hits++;
-            this.stats.hits++; // Count as hit
-            l3Set[l3BlockIndex].lastAccess = currentTime;
-            
-            // Load into L2 and L1
-            this.loadBlock(index, tag, address, currentTime);
-            this.loadBlockL2(l2Index, tag, address, currentTime);
-          }
-        }
-      }
-      
-      if (!hit) {
-        // Complete miss - access memory
-        this.stats.misses++;
-        this.stats.memoryAccesses++;
-        accessTime = 100; // 100 cycles for memory access
-        stallCycles = 99;
-        level = 0;
-        
-        if (type === 'write') {
-          this.stats.writeMisses++;
-        }
-        
-        // Load block into all cache levels
-        this.loadBlock(index, tag, address, currentTime);
-        
-        if (levels >= 2 && this.l2Cache.length > 0) {
-          const l2Index = blockAddr % this.l2Cache.length;
-          this.loadBlockL2(l2Index, tag, address, currentTime);
-        }
-        
-        if (levels >= 3 && this.l3Cache.length > 0) {
-          const l3Index = blockAddr % this.l3Cache.length;
-          this.loadBlockL3(l3Index, tag, address, currentTime);
+
+      block.lastAccess = currentTime;
+      block.accessCount++;
+
+      this.applyWrite(block, type, writePolicy);
+    }
+
+    // -------------------------
+    // L2 lookup
+    // -------------------------
+    if (!hit && levels >= 2) {
+      const l2Result = this.findBlock(this.l2Cache, address);
+
+      if (l2Result.blockIndex !== -1) {
+        const block = this.l2Cache[l2Result.index][l2Result.blockIndex];
+
+        hit = true;
+        level = 2;
+        accessTime = 10;
+
+        this.stats.hits++;
+        this.stats.l2Hits++;
+
+        block.lastAccess = currentTime;
+        block.accessCount++;
+
+        // Promote the block to L1.
+        this.loadBlock(
+          this.cache,
+          address,
+          currentTime,
+          false
+        );
+
+        const l1ResultAfterLoad = this.findBlock(this.cache, address);
+
+        if (l1ResultAfterLoad.blockIndex !== -1) {
+          const l1Block =
+            this.cache[l1ResultAfterLoad.index][l1ResultAfterLoad.blockIndex];
+
+          this.applyWrite(l1Block, type, writePolicy);
         }
       }
     }
 
+    // -------------------------
+    // L3 lookup
+    // -------------------------
+    if (!hit && levels >= 3) {
+      const l3Result = this.findBlock(this.l3Cache, address);
+
+      if (l3Result.blockIndex !== -1) {
+        const block = this.l3Cache[l3Result.index][l3Result.blockIndex];
+
+        hit = true;
+        level = 3;
+        accessTime = 30;
+
+        this.stats.hits++;
+        this.stats.l3Hits++;
+
+        block.lastAccess = currentTime;
+        block.accessCount++;
+
+        // Promote L3 -> L2 -> L1.
+        this.loadBlock(
+          this.l2Cache,
+          address,
+          currentTime,
+          false
+        );
+
+        this.loadBlock(
+          this.cache,
+          address,
+          currentTime,
+          false
+        );
+
+        const l1ResultAfterLoad = this.findBlock(this.cache, address);
+
+        if (l1ResultAfterLoad.blockIndex !== -1) {
+          const l1Block =
+            this.cache[l1ResultAfterLoad.index][l1ResultAfterLoad.blockIndex];
+
+          this.applyWrite(l1Block, type, writePolicy);
+        }
+      }
+    }
+
+    // -------------------------
+    // Main memory
+    // -------------------------
+    if (!hit) {
+      this.stats.misses++;
+      this.stats.memoryAccesses++;
+
+      level = 0;
+      accessTime = 100;
+
+      // Write-allocate:
+      // On a write miss, first load the block into the cache,
+      // then perform the write on the cached block.
+      this.loadBlock(
+        this.cache,
+        address,
+        currentTime,
+        false
+      );
+
+      if (levels >= 2) {
+        this.loadBlock(
+          this.l2Cache,
+          address,
+          currentTime,
+          false
+        );
+      }
+
+      if (levels >= 3) {
+        this.loadBlock(
+          this.l3Cache,
+          address,
+          currentTime,
+          false
+        );
+      }
+
+      const l1ResultAfterLoad = this.findBlock(this.cache, address);
+
+      if (l1ResultAfterLoad.blockIndex !== -1) {
+        const l1Block =
+          this.cache[l1ResultAfterLoad.index][l1ResultAfterLoad.blockIndex];
+
+        this.applyWrite(l1Block, type, writePolicy);
+      }
+    }
+
+    // -------------------------
+    // Write statistics
+    // -------------------------
+    if (type === 'write') {
+      if (hit) {
+        this.stats.writeHits++;
+      } else {
+        this.stats.writeMisses++;
+      }
+    }
+
+    // -------------------------
+    // Timing
+    // -------------------------
+    const stallCycles = Math.max(0, accessTime - 1);
+
     this.stats.stallCycles += stallCycles;
-    this.stats.powerConsumption += hit ? 0.5 : 5; // Simplified power model
+    this.stats.totalAccessTime += accessTime;
+
+    /*
+     * Simplified educational power model.
+     * These are arbitrary simulator units, not watts.
+     */
+    this.stats.powerConsumption += hit ? 0.5 : 5;
 
     this.accessHistory.push({
       address,
@@ -191,99 +339,81 @@ class CacheSimulator {
       hit,
       level,
       accessTime,
-      index,
-      tag,
+      index: l1Result.index,
+      tag: l1Result.tag,
       timestamp: currentTime
     });
 
-    return { hit, level, accessTime, index, tag };
+    return {
+      hit,
+      level,
+      accessTime,
+      index: l1Result.index,
+      tag: l1Result.tag
+    };
   }
 
-  loadBlock(index, tag, address, currentTime) {
-    const set = this.cache[index] || [];
-    const { replacement } = this.config;
-    
-    // Find empty slot
-    let targetIndex = set.findIndex(block => block && !block.valid);
-    
+  applyWrite(block, type, writePolicy) {
+    if (!block || type !== 'write') {
+      return;
+    }
+
+    if (writePolicy === 'write-back') {
+      // Write-back: modify cache and mark it dirty.
+      block.dirty = true;
+    } else if (writePolicy === 'write-through') {
+      // Write-through: memory is updated immediately.
+      block.dirty = false;
+      this.stats.memoryWrites++;
+    }
+  }
+
+  loadBlock(cache, address, currentTime, dirty = false) {
+    if (!cache || cache.length === 0) {
+      return;
+    }
+
+    const { index, tag } = this.getAddressParts(address, cache);
+    const set = cache[index] || [];
+
+    let targetIndex = set.findIndex(
+      block => block && !block.valid
+    );
+
     if (targetIndex === -1) {
-      // Need to replace
-      targetIndex = this.selectVictim(set, replacement);
-      
-      if (set[targetIndex]) {
+      targetIndex = this.selectVictim(set, this.config.replacement);
+
+      const victim = set[targetIndex];
+
+      if (victim && victim.valid) {
+        /*
+         * Only L1 dirty evictions are counted as simulated
+         * memory write-backs. L2/L3 are treated as lower-level
+         * cache copies in this educational model.
+         */
+        if (cache === this.cache && victim.dirty) {
+          this.stats.memoryWrites++;
+        }
+
         this.replacementHistory.push({
           index,
-          tag: set[targetIndex].tag,
+          tag: victim.tag,
           newTag: tag,
-          policy: replacement,
+          policy: this.config.replacement,
           timestamp: currentTime
         });
       }
     }
-    
-    if (!this.cache[index]) {
-      this.cache[index] = [];
-    }
-    
-    this.cache[index][targetIndex] = {
-      valid: true,
-      tag,
-      data: address,
-      dirty: false,
-      lastAccess: currentTime,
-      accessCount: 1,
-      insertTime: currentTime
-    };
-  }
 
-  loadBlockL2(index, tag, address, currentTime) {
-    if (this.l2Cache.length === 0) return;
-    
-    const set = this.l2Cache[index] || [];
-    const { replacement } = this.config;
-    
-    let targetIndex = set.findIndex(block => block && !block.valid);
-    
-    if (targetIndex === -1) {
-      targetIndex = this.selectVictim(set, replacement);
+    if (!cache[index]) {
+      cache[index] = [];
     }
-    
-    if (!this.l2Cache[index]) {
-      this.l2Cache[index] = [];
-    }
-    
-    this.l2Cache[index][targetIndex] = {
-      valid: true,
-      tag,
-      data: address,
-      dirty: false,
-      lastAccess: currentTime,
-      accessCount: 1,
-      insertTime: currentTime
-    };
-  }
 
-  loadBlockL3(index, tag, address, currentTime) {
-    if (this.l3Cache.length === 0) return;
-    
-    const set = this.l3Cache[index] || [];
-    const { replacement } = this.config;
-    
-    let targetIndex = set.findIndex(block => block && !block.valid);
-    
-    if (targetIndex === -1) {
-      targetIndex = this.selectVictim(set, replacement);
-    }
-    
-    if (!this.l3Cache[index]) {
-      this.l3Cache[index] = [];
-    }
-    
-    this.l3Cache[index][targetIndex] = {
+    cache[index][targetIndex] = {
       valid: true,
       tag,
       data: address,
-      dirty: false,
+      dirty,
       lastAccess: currentTime,
       accessCount: 1,
       insertTime: currentTime
@@ -291,37 +421,107 @@ class CacheSimulator {
   }
 
   selectVictim(set, policy) {
-    const validBlocks = set.filter(block => block && block.valid);
-    if (validBlocks.length === 0) return 0;
-    
+    if (!set || set.length === 0) {
+      return 0;
+    }
+
+    const validBlocks = set.filter(
+      block => block && block.valid
+    );
+
+    if (validBlocks.length === 0) {
+      return 0;
+    }
+
     switch (policy) {
       case 'lru':
-        return set.reduce((minIdx, block, idx, arr) => 
-          block && arr[minIdx] && block.lastAccess < arr[minIdx].lastAccess ? idx : minIdx, 0);
+        return set.reduce((minIdx, block, idx, arr) => {
+          if (!block || !block.valid) {
+            return minIdx;
+          }
+
+          if (
+            !arr[minIdx] ||
+            !arr[minIdx].valid ||
+            block.lastAccess < arr[minIdx].lastAccess
+          ) {
+            return idx;
+          }
+
+          return minIdx;
+        }, 0);
+
       case 'fifo':
-        return set.reduce((minIdx, block, idx, arr) => 
-          block && arr[minIdx] && block.insertTime < arr[minIdx].insertTime ? idx : minIdx, 0);
+        return set.reduce((minIdx, block, idx, arr) => {
+          if (!block || !block.valid) {
+            return minIdx;
+          }
+
+          if (
+            !arr[minIdx] ||
+            !arr[minIdx].valid ||
+            block.insertTime < arr[minIdx].insertTime
+          ) {
+            return idx;
+          }
+
+          return minIdx;
+        }, 0);
+
       case 'lfu':
-        return set.reduce((minIdx, block, idx, arr) => 
-          block && arr[minIdx] && block.accessCount < arr[minIdx].accessCount ? idx : minIdx, 0);
+        return set.reduce((minIdx, block, idx, arr) => {
+          if (!block || !block.valid) {
+            return minIdx;
+          }
+
+          if (
+            !arr[minIdx] ||
+            !arr[minIdx].valid ||
+            block.accessCount < arr[minIdx].accessCount
+          ) {
+            return idx;
+          }
+
+          return minIdx;
+        }, 0);
+
       case 'random':
         return Math.floor(Math.random() * set.length);
+
       default:
         return 0;
     }
   }
 
   getHitRatio() {
-    return this.stats.totalAccesses > 0 ? 
-      (this.stats.hits / this.stats.totalAccesses * 100).toFixed(2) : 0;
+    if (this.stats.totalAccesses === 0) {
+      return '0.00';
+    }
+
+    return (
+      (this.stats.hits / this.stats.totalAccesses) *
+      100
+    ).toFixed(2);
   }
 
   getAMAT() {
-    const hitTime = 1;
-    const missRate = this.stats.totalAccesses > 0 ? 
-      this.stats.misses / this.stats.totalAccesses : 0;
-    const missPenalty = 100;
-    return (hitTime + missRate * missPenalty).toFixed(2);
+    if (this.stats.totalAccesses === 0) {
+      return '0.00';
+    }
+
+    /*
+     * Exact average latency for this simulator's
+     * simplified hierarchy:
+     *
+     * L1 hit = 1
+     * L2 hit = 10
+     * L3 hit = 30
+     * Memory = 100
+     */
+    return (
+      this.stats.totalAccessTime /
+      this.stats.totalAccesses
+    ).toFixed(2);
   }
 }
 
@@ -379,41 +579,44 @@ const App = () => {
     }
   };
 
-  const runSimulation = () => {
-    if (!simulator) return;
-    
-    const addrList = addresses.split(',').map(a => parseInt(a.trim())).filter(a => !isNaN(a));
-    
-    if (currentStep < addrList.length) {
-      const addr = addrList[currentStep];
-      const type = Math.random() > 0.7 ? 'write' : 'read';
-      simulator.access(addr, type, currentStep);
-      setCurrentStep(currentStep + 1);
-      // Force re-render by creating new object reference
-      setSimulator(new CacheSimulator(config));
-      setSimulator(simulator);
-    } else {
-      setIsRunning(false);
-    }
-  };
+const runSimulation = () => {
+  if (!simulator) return;
 
-  const runAll = () => {
-    if (!simulator) return;
-    
-    const addrList = addresses.split(',').map(a => parseInt(a.trim())).filter(a => !isNaN(a));
-    
-    addrList.forEach((addr, idx) => {
-      const type = Math.random() > 0.7 ? 'write' : 'read';
-      simulator.access(addr, type, idx);
-    });
-    
-    setCurrentStep(addrList.length);
-    // Force re-render
-    const newSim = simulator;
-    setSimulator(null);
-    setTimeout(() => setSimulator(newSim), 0);
+  const addrList = addresses
+    .split(',')
+    .map(a => parseInt(a.trim(), 10))
+    .filter(a => !isNaN(a));
+
+  if (currentStep < addrList.length) {
+    const addr = addrList[currentStep];
+    const type = Math.random() > 0.7 ? 'write' : 'read';
+
+    simulator.access(addr, type, currentStep);
+
+    setCurrentStep(currentStep + 1);
+    setSimulator(simulator);
+  } else {
     setIsRunning(false);
-  };
+  }
+};
+
+const runAll = () => {
+  if (!simulator) return;
+
+  const addrList = addresses
+    .split(',')
+    .map(a => parseInt(a.trim(), 10))
+    .filter(a => !isNaN(a));
+
+  addrList.forEach((addr, idx) => {
+    const type = Math.random() > 0.7 ? 'write' : 'read';
+    simulator.access(addr, type, idx);
+  });
+
+  setCurrentStep(addrList.length);
+  setSimulator(simulator);
+  setIsRunning(false);
+};
 
   const reset = () => {
     initSimulator();
@@ -438,22 +641,62 @@ const App = () => {
     a.download = 'cache_simulation_results.json';
     a.click();
   };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (autoRun && isRunning) {
-      const timer = setTimeout(runSimulation, 500);
-      return () => clearTimeout(timer);
+  if (!autoRun || !isRunning || !simulator) {
+    return undefined;
+  }
+
+  const timer = setTimeout(() => {
+    const addrList = addresses
+      .split(',')
+      .map(a => parseInt(a.trim(), 10))
+      .filter(a => !isNaN(a));
+
+    if (currentStep < addrList.length) {
+      const addr = addrList[currentStep];
+      const type = Math.random() > 0.7 ? 'write' : 'read';
+
+      simulator.access(addr, type, currentStep);
+      setCurrentStep(currentStep + 1);
+      setSimulator(simulator);
+    } else {
+      setIsRunning(false);
     }
-  }, [autoRun, isRunning, currentStep]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, 500);
+
+  return () => clearTimeout(timer);
+}, [
+  autoRun,
+  isRunning,
+  currentStep,
+  simulator,
+  addresses
+]);
 
   if (!simulator) return <div className="flex items-center justify-center h-screen">Loading...</div>;
 
-  const hitMissData = [
-    { name: 'L1 Hits', value: simulator.stats.l1Hits, fill: '#10b981' },
-    { name: 'L3 Hits', value: simulator.stats.l3Hits, fill: '#8b5cf6' },
-    { name: 'Misses', value: simulator.stats.misses, fill: '#ef4444' }
-  ];
-
+const hitMissData = [
+  {
+    name: 'L1 Hits',
+    value: simulator.stats.l1Hits,
+    fill: '#10b981'
+  },
+  {
+    name: 'L2 Hits',
+    value: simulator.stats.l2Hits,
+    fill: '#3b82f6'
+  },
+  {
+    name: 'L3 Hits',
+    value: simulator.stats.l3Hits,
+    fill: '#8b5cf6'
+  },
+  {
+    name: 'Misses',
+    value: simulator.stats.misses,
+    fill: '#ef4444'
+  }
+];
   const timelineData = simulator.accessHistory.slice(-20).map((access, idx) => ({
     step: access.timestamp,
     time: access.accessTime,
@@ -717,7 +960,9 @@ const App = () => {
           <div className={`${cardClass} border rounded-lg p-6`}>
             <h3 className="text-xl font-bold mb-4">AMAT Breakdown</h3>
             <div className="space-y-2 font-mono text-sm">
-              <div>AMAT = Hit Time + Miss Rate × Miss Penalty</div>
+              <div className="text-sm">
+  AMAT = Average access time across L1, L2, L3, and memory
+</div>
               <div>AMAT = 1 + {(simulator.stats.misses / (simulator.stats.totalAccesses || 1)).toFixed(4)} × 100</div>
               <div className="text-2xl font-bold text-blue-500">AMAT = {simulator.getAMAT()} cycles</div>
             </div>
@@ -957,7 +1202,7 @@ const App = () => {
             </h3>
             <div className="space-y-3 text-sm">
               <div>
-                <strong>Hit Ratio:</strong> Percentage of memory accesses found in cache. Higher is better. Typical values: 90-99%.
+                <strong>Hit Ratio:</strong> Percentage of memory accesses found in cache. Higher is better. Higher hit ratios generally indicate better cache effectiveness.
               </div>
               <div>
                 <strong>AMAT (Average Memory Access Time):</strong> Average cycles to access data. Lower is better. Combines hit time and miss penalty.
@@ -1002,9 +1247,9 @@ const App = () => {
               <div className={`p-3 rounded ${darkMode ? 'bg-pink-900 bg-opacity-30' : 'bg-pink-100'}`}>
                 <strong>Access Patterns:</strong>
                 <div className="mt-1 space-y-1 opacity-75">
-                  • Sequential (0,1,2,3...) = Best hit ratio<br/>
+                  • Sequential (0,1,2,3...) = Often benefits from spatial locality<br/>
                   • Loop (0-15 repeating) = Good hit ratio if cache ≥ 16<br/>
-                  • Random = Worst hit ratio<br/>
+                  • Random = Often has poorer hit ratio<br/>
                   • Custom = Enter your own: e.g., 0,1,2,3,0,1,4,5
                 </div>
               </div>
